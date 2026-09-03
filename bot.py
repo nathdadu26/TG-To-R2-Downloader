@@ -5,6 +5,16 @@ import hashlib
 import asyncio
 import logging
 import boto3
+
+# Naye Python versions (3.12+) me asyncio.get_event_loop() ab loop khud-se create
+# nahi karta agar koi loop already set/running na ho — pyrogram apne import ke
+# time hi (pyrogram/sync.py) yeh call kar deta hai, isliye pyrogram import se
+# PEHLE hi explicitly ek event loop create karke set kar dete hain.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from aiohttp import web
 from dotenv import load_dotenv
 from pyrogram import Client, filters
@@ -489,5 +499,4 @@ async def main():
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main())
