@@ -5,6 +5,7 @@ import hashlib
 import asyncio
 import logging
 import boto3
+from aiohttp import web
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from telethon import TelegramClient
@@ -46,6 +47,10 @@ FOLDER_NAME = "telegram files"
 
 # MINIMUM VIDEO DURATION (in seconds)
 MIN_VIDEO_DURATION = 10
+
+# Render (or any host) requires a web port to be bound so the free-tier
+# health checks / keep-alive pings have something to hit.
+PORT = int(os.getenv("PORT", "8080"))
 
 # --- CLIENT INITIALIZATIONS ---
 
@@ -369,9 +374,27 @@ async def handle_download_command(client, message):
         logger.error(f"Command Error: {e}", exc_info=True)
         await updater.update(f"❌ **Error:** `{str(e)}`", force=True)
 
+# --- TINY WEB SERVER (Render free-tier ke liye) ---
+# Render ka free plan sirf Web Services par milta hai jo ek PORT par sunte hain.
+# Yeh chhota server sirf ek health-check route deta hai jise UptimeRobot jaisi
+# service har 10-14 minute me ping karke bot ko so-ne (sleep) se rokegi.
+async def handle_health(request):
+    return web.Response(text="Bot is alive!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"🌐 Health-check web server started on port {PORT}")
+
 # --- START BOT ---
 async def main():
     await hashes_collection.create_index("hash", unique=True)
+    await start_web_server()
     await userbot.start()
     await bot.start()
     logger.info("🚀 Bot is running with Progress Tracker, Rate Limiters & Logger!")
