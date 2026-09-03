@@ -11,6 +11,7 @@ from pyrogram import Client, filters
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.errors import FloodWaitError
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- LOGGING SETUP ---
@@ -47,6 +48,17 @@ FOLDER_NAME = "telegram files"
 
 # MINIMUM VIDEO DURATION (in seconds)
 MIN_VIDEO_DURATION = 10
+
+# MAXIMUM VIDEO SIZE (in MB) — isse bade videos skip ho jayenge (jaise duration wala check)
+MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", "200"))
+
+# Isse bada (aur MAX_VIDEO_SIZE_MB tak) koi bhi video "bada file" mana jayega
+# aur usse akele (1 at a time) download kiya jayega. Isse chhote videos
+# CONCURRENT_DOWNLOADS ki limit ke saath parallel chalte hain.
+LARGE_FILE_THRESHOLD_MB = int(os.getenv("LARGE_FILE_THRESHOLD_MB", "100"))
+
+# Bulk /download me ek saath kitne (chhoti) videos parallel download+upload honge
+CONCURRENT_DOWNLOADS = int(os.getenv("CONCURRENT_DOWNLOADS", "5"))
 
 # Render (or any host) requires a web port to be bound so the free-tier
 # health checks / keep-alive pings have something to hit.
@@ -109,12 +121,33 @@ def get_video_duration(msg):
 
     return None
 
+def get_video_size_mb(msg):
+    """Telethon Message se video/document ka size (MB me) safely extract karta hai."""
+    try:
+        if getattr(msg, "file", None) and msg.file.size:
+            return msg.file.size / (1024 * 1024)
+    except Exception:
+        pass
+
+    # Fallback: raw document/video object se size nikalna
+    if getattr(msg, "document", None) and getattr(msg.document, "size", None):
+        return msg.document.size / (1024 * 1024)
+    if getattr(msg, "video", None) and getattr(msg.video, "size", None):
+        return msg.video.size / (1024 * 1024)
+
+    return None
+
 def is_valid_video(msg):
-    """Check karta hai ki message valid video hai ya nahi aur >= 10 seconds hai ya nahi."""
+    """Check karta hai ki message valid video hai, duration >= 10s ho, aur size MAX_VIDEO_SIZE_MB se zyada na ho."""
     duration = get_video_duration(msg)
-    if duration is not None and duration >= MIN_VIDEO_DURATION:
-        return True
-    return False
+    if duration is None or duration < MIN_VIDEO_DURATION:
+        return False
+
+    size_mb = get_video_size_mb(msg)
+    if size_mb is not None and size_mb > MAX_VIDEO_SIZE_MB:
+        return False
+
+    return True
 
 def create_progress_bar(current, total):
     """Progress Bar visualization."""
@@ -222,8 +255,10 @@ async def start_command(client, message):
         "Main aapka **Video Downloader & Cloud Uploader Bot** hu.\n\n"
         "✨ **Features:**\n"
         "• Single Video / Bulk Channel Download\n"
-        "• Skipped videos < 10 seconds duration\n"
-        "• Single Progress Message (10s auto-update)\n"
+        f"• Skipped videos < {MIN_VIDEO_DURATION} seconds duration\n"
+        f"• Skipped videos > {MAX_VIDEO_SIZE_MB}MB size\n"
+        f"• Chhoti files {CONCURRENT_DOWNLOADS}x parallel, badi files (>= {LARGE_FILE_THRESHOLD_MB}MB) ek-ek karke\n"
+        "• Single Progress Message (auto-update)\n"
         "• Duplicate Detection via SHA-256 Hash\n\n"
         "Usage: `/download {link_ya_id}`"
     )
@@ -305,7 +340,7 @@ async def handle_download_command(client, message):
         channel_name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(target)
         await updater.update("🔍 Scanning channel for eligible videos...", force=True)
 
-        # 1. Safe video filtering with Document/Video Duration Check
+        # 1. Safe video filtering with Document/Video Duration & Size Check
         valid_messages = []
         async for msg in userbot.iter_messages(entity):
             if is_valid_video(msg):
@@ -313,66 +348,119 @@ async def handle_download_command(client, message):
 
         total_videos = len(valid_messages)
         if total_videos == 0:
-            await updater.update("⚠️ No videos longer than 10 seconds found.", force=True)
+            await updater.update(
+                f"⚠️ No eligible videos found (duration >= {MIN_VIDEO_DURATION}s and size <= {MAX_VIDEO_SIZE_MB}MB).",
+                force=True,
+            )
             return
 
-        logger.info(f"Found {total_videos} eligible videos to process.")
+        # Size ke hisaab se do groups banao: badi files akele download hongi,
+        # chhoti files CONCURRENT_DOWNLOADS ki limit ke saath parallel
+        large_messages = []
+        small_messages = []
+        for msg in valid_messages:
+            size_mb = get_video_size_mb(msg)
+            if size_mb is not None and size_mb >= LARGE_FILE_THRESHOLD_MB:
+                large_messages.append(msg)
+            else:
+                small_messages.append(msg)
 
-        uploaded_count = 0
-        skipped_count = 0
-        failed_count = 0
+        logger.info(
+            f"Found {total_videos} eligible videos "
+            f"({len(small_messages)} small @ {CONCURRENT_DOWNLOADS}x parallel, "
+            f"{len(large_messages)} large @ 1x sequential)."
+        )
+
+        # Shared state — sab parallel workers isi ko update karte hain (lock se protected)
+        counters = {"processed": 0, "uploaded": 0, "skipped": 0, "failed": 0}
+        lock = asyncio.Lock()
+        semaphore_small = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
+        semaphore_large = asyncio.Semaphore(1)
         loop = asyncio.get_event_loop()
         task_start_time = time.time()
 
-        # 2. Iterate and process each video — sirf ek combined status message update hota hai (rate-limited)
-        for idx, msg in enumerate(valid_messages, 1):
-            file_path = await userbot.download_media(msg)
+        async def process_single_video(msg, semaphore):
+            async with semaphore:
+                try:
+                    file_path = await userbot.download_media(msg)
 
-            if not file_path:
-                failed_count += 1
-            else:
-                filename = f"vid_{msg.id}_{os.path.basename(file_path)}"
-                file_hash = get_file_hash(file_path)
-
-                if await is_duplicate(file_hash):
-                    skipped_count += 1
-                    logger.info(f"Skipped duplicate video ID {msg.id}")
-                else:
-                    r2_key = f"{FOLDER_NAME}/{filename}"
-                    success = await loop.run_in_executor(
-                        None, upload_to_r2_silent, file_path, r2_key
-                    )
-
-                    if success:
-                        await save_hash(file_hash, filename)
-                        uploaded_count += 1
-                        logger.info(f"Uploaded video ID {msg.id} to R2.")
+                    if not file_path:
+                        async with lock:
+                            counters["failed"] += 1
                     else:
-                        failed_count += 1
-                        logger.error(f"Failed uploading video ID {msg.id}")
+                        filename = f"vid_{msg.id}_{os.path.basename(file_path)}"
+                        file_hash = get_file_hash(file_path)
 
-                if os.path.exists(file_path):
-                    os.remove(file_path)
+                        if await is_duplicate(file_hash):
+                            async with lock:
+                                counters["skipped"] += 1
+                            logger.info(f"Skipped duplicate video ID {msg.id}")
+                        else:
+                            r2_key = f"{FOLDER_NAME}/{filename}"
+                            success = await loop.run_in_executor(
+                                None, upload_to_r2_silent, file_path, r2_key
+                            )
 
-            # ETA: ab tak ke average time per video se remaining videos ka andaza
-            elapsed = time.time() - task_start_time
-            avg_per_video = elapsed / idx
-            eta_seconds = avg_per_video * (total_videos - idx)
+                            if success:
+                                await save_hash(file_hash, filename)
+                                async with lock:
+                                    counters["uploaded"] += 1
+                                logger.info(f"Uploaded video ID {msg.id} to R2.")
+                            else:
+                                async with lock:
+                                    counters["failed"] += 1
+                                logger.error(f"Failed uploading video ID {msg.id}")
 
-            status_text = build_bulk_progress_text(
-                channel_name, idx, total_videos, uploaded_count, skipped_count, failed_count, eta_seconds
-            )
-            # force=False -> RateLimitedStatusUpdater khud decide karega kab actually Telegram par edit bhejna hai
-            await updater.update(status_text)
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+
+                except FloodWaitError as e:
+                    logger.warning(f"FloodWait: sleeping {e.seconds}s (video ID {msg.id})")
+                    await asyncio.sleep(e.seconds)
+                    async with lock:
+                        counters["failed"] += 1
+                except Exception as e:
+                    logger.error(f"Error processing video ID {msg.id}: {e}", exc_info=True)
+                    async with lock:
+                        counters["failed"] += 1
+                finally:
+                    async with lock:
+                        counters["processed"] += 1
+                        processed = counters["processed"]
+                        uploaded = counters["uploaded"]
+                        skipped = counters["skipped"]
+                        failed = counters["failed"]
+
+                    elapsed = time.time() - task_start_time
+                    avg_per_video = elapsed / processed if processed else 0
+                    # CONCURRENT_DOWNLOADS videos ek saath chal rahe hain, isliye ETA me
+                    # concurrency factor bhi divide karte hain taaki andaza sahi rahe
+                    remaining = total_videos - processed
+                    eta_seconds = (avg_per_video * remaining) / CONCURRENT_DOWNLOADS
+
+                    status_text = build_bulk_progress_text(
+                        channel_name, processed, total_videos, uploaded, skipped, failed, eta_seconds
+                    )
+                    # force=False -> RateLimitedStatusUpdater khud decide karega kab actually edit bhejni hai
+                    await updater.update(status_text)
+
+        # 2. Chhoti files 5-parallel me, badi files ek-ek karke — dono groups ek saath launch
+        #    hote hain, har group apni semaphore limit follow karta hai
+        tasks = (
+            [process_single_video(msg, semaphore_small) for msg in small_messages]
+            + [process_single_video(msg, semaphore_large) for msg in large_messages]
+        )
+        await asyncio.gather(*tasks)
 
         final_report = build_bulk_final_report(
-            channel_name, total_videos, uploaded_count, skipped_count, failed_count
+            channel_name, total_videos, counters["uploaded"], counters["skipped"], counters["failed"]
         )
         await updater.update(final_report, force=True)
 
     except Exception as e:
         logger.error(f"Command Error: {e}", exc_info=True)
         await updater.update(f"❌ **Error:** `{str(e)}`", force=True)
+
 
 # --- TINY WEB SERVER (Render free-tier ke liye) ---
 # Render ka free plan sirf Web Services par milta hai jo ek PORT par sunte hain.
